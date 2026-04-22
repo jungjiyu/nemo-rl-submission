@@ -1,22 +1,35 @@
-# VUVLM: Geometry-Aware SVG Auxiliary Construction
+# RedPen VLM
 
-**VUVLM** is a research prototype for training vision-language models to generate **SVG-based auxiliary constructions** for geometry problem solving.
+**Creating Interpretable SVG Synthesis VLM**
 
-The project investigates whether a multimodal model can learn to add useful geometric constructions — auxiliary lines, points, and circles — in a structured SVG format. The generated SVG is rendered back into an image and used to improve downstream geometry reasoning.
+> NeMotron Hackathon · Seoul · 2026
+> Team **pkill nvidia-smi** — Kim Yoonsik, Song Kayeon, Park Chanwoo, Jung Jiyu
 
-The system is organized into three stages:
-
-1. **SVG data construction** from MathCanvas-Edit trajectories
-2. **Cold-start SFT** for image-instruction-to-SVG generation
-3. **Geometry-aware GRPO** using format, geometry, and solving rewards
+RedPen VLM is a vision-language model that **draws interpretable auxiliary lines** on geometry problems. Instead of describing a construction in prose, the model emits structured SVG that can be parsed, rendered, and scored — turning "add a helper line" into a measurable generation task.
 
 ---
 
-## Motivation
+## The Problem
 
-Geometry problems often require auxiliary constructions that are not present in the original diagram. Humans routinely solve such problems by drawing additional lines, points, or circles, but most VLMs only reason over the given image and text — they do not explicitly modify the diagram.
+Even Gemini 3 Pro can't ground what it sees.
 
-This project treats auxiliary construction as a generation problem:
+When asked to locate a specific object in a crowded image (e.g. "find tangerine #57"), state-of-the-art VLMs produce plausible-sounding but spatially incorrect answers. They reason *about* the image without anchoring that reasoning to real pixel coordinates.
+
+Geometry problem solving is an extreme case of this. Human solvers routinely draw auxiliary lines, mark points, and trisect angles — constructions that don't exist in the original diagram but make the problem tractable. Most VLMs can't.
+
+---
+
+## The Goal
+
+A VLM that produces auxiliary constructions with three properties:
+
+| Property          | Meaning                                                                 |
+| ----------------- | ----------------------------------------------------------------------- |
+| **Interpretable** | Every stroke is a parseable SVG element with real coordinates.          |
+| **Grounded**      | The drawn line is the same object the reasoning refers to.              |
+| **Useful**        | Adding the auxiliary line improves the solve — ΔG2U > 0.                |
+
+The core idea is to make auxiliary construction a **generation problem whose output is simultaneously text (SVG) and image (rendered result)** — so it can be supervised, judged, and RL-optimized.
 
 ```text
 Geometry problem image + instruction
@@ -25,152 +38,65 @@ VLM generates SVG auxiliary construction
         ↓
 SVG is rendered back into an image
         ↓
-Model or judge re-solves the problem with the augmented diagram
+Solver/judge re-evaluates the problem with the augmented diagram
 ```
-
-The core idea is to make the construction **interpretable, renderable, and rewardable** by representing it as SVG.
 
 ---
 
-## Project Overview
+## Training Overview
+
+| Component     | Choice                                                                                     |
+| ------------- | ------------------------------------------------------------------------------------------ |
+| **Framework** | NeMo-RL                                                                                    |
+| **Model**     | NVIDIA-Nemotron-Nano-12B-v2-VL-BF16                                                        |
+| **SFT data**  | MathCanvas-Edit *Foundational Structure Generation* subset (~1M) + Geometry3K              |
+| **RL data**   | Geometry3K (train, 2.1K)                                                                   |
+
+Two-stage pipeline:
 
 ```mermaid
 flowchart LR
-    A[MathCanvas-Edit] --> B[SVG Data Construction]
-    B --> C[Image-Instruction-SVG SFT Data]
-    C --> D[LoRA SFT<br/>Nemotron Nano 12B v2 VL]
-    D --> E[Checkpoint Validation<br/>Renderability + Generation Probes]
-    E --> F[Geometry3K GRPO]
-    F --> G[SVG Auxiliary Candidates]
-    G --> H[Reward Suite<br/>Format + Geometry + Solve]
-    H --> F
+    A[MathCanvas-Edit<br/>+ Geometry3K] --> B[Image–Instruction–SVG<br/>Triplets]
+    B --> C[LoRA SFT<br/>Nemotron Nano 12B v2 VL]
+    C --> D[Checkpoint Validation<br/>LPIPS + render_ok]
+    D --> E[Geometry3K GRPO]
+    E --> F[Reward Suite<br/>R_render + R_judge + R_solve]
+    F --> E
 ```
 
 ---
 
-## Repository Layout
+## Stage 1 — SFT: Image–Instruction–SVG Triplets
+
+Each MathCanvas-Edit transition becomes a supervised editing sample:
 
 ```text
-vuvlm/
-├── inference/
-│   └── async_eval_geometry3k_friendli.py
-│
-├── sft-data/
-│   ├── MathCanvas/
-│   ├── make_sft_1k_llava.py
-│   ├── make_sft_10k.py
-│   ├── make_sft_100k.py
-│   ├── render_variants_v2.py
-│   ├── emit_semantic.py
-│   ├── canonical_svg.py
-│   └── sft_llava_1k/
-│
-├── nemo-RL-v0.5.0/
-│   ├── examples/
-│   ├── hackaton/
-│   ├── tools/
-│   ├── results/
-│   ├── logs/
-│   ├── run_real.sh
-│   ├── run_rl.sh
-│   ├── run_rl_base.sh
-│   └── run_rl_smoke.sh
-│
-└── docker-compose.yml
+Input (image)       : current partial diagram
+Input (instruction) : "Construct points C and D such that ABCD is a square."
+Output (SVG)        : next-step diagram with the new construction encoded as SVG
 ```
 
----
-
-## Setup
-
-Clone the repository and set `PROJECT_ROOT` to point at the project directory. All commands below assume this variable is defined.
-
-```bash
-git clone <repo-url> vuvlm
-cd vuvlm
-export PROJECT_ROOT=$(pwd)
-```
-
-Add the export to your shell profile (`~/.bashrc`, `~/.zshrc`) to persist it across sessions.
-
----
-
-## Key Design Choices
-
-### 1. Tractable Image–Instruction–SVG Triplets
-
-Each MathCanvas-Edit transition is converted into a supervised editing sample:
-
-```text
-code_list[i] + instruction_list[i] → code_list[i+1]
-```
-
-which maps to:
-
-```text
-Image       = clean render of the current diagram
-Instruction = natural-language geometric edit
-SVG         = semantic SVG of the next construction step
-```
-
-Example:
-
-```text
-Input Image:   current partial diagram
-Instruction:   "Construct points C and D such that ABCD is a square."
-Target SVG:    next-step diagram with the new construction encoded as SVG
-```
-
----
-
-### 2. Semantic SVG Targets
-
-The target is not a raw Matplotlib SVG blob — it is emitted as a structured SVG with separate semantic groups:
+The SVG target uses semantic groups so base geometry and new constructions are separable:
 
 ```xml
-<svg>
-  <desc>
-    DDAR construction program / metadata
-  </desc>
-
-  <g id="base">
-    <!-- existing geometry -->
+<svg viewBox="0 0 300 220">
+  <g id="base" stroke="black">                              <!-- existing geometry -->
+    <line x1="70" y1="150" x2="230" y2="150"/>
+    <circle cx="70"  cy="150"/>                             <!-- A -->
+    <circle cx="230" cy="150"/>                             <!-- B -->
   </g>
-
-  <g id="edit">
-    <!-- newly added construction -->
-  </g>
-
-  <g id="labels">
-    <!-- point labels -->
+  <g id="edit" stroke="red" stroke-dasharray="5.5,2.4">     <!-- new construction -->
+    <line/> <line/> <line/>                                 <!-- AD, DC, CB -->
+    <circle/> <circle/>                                     <!-- new points C, D -->
   </g>
 </svg>
 ```
 
-Visual convention:
+Visual convention: existing geometry in **black solid**, new construction in **red dashed** — hence *RedPen*.
 
-| Element type                   | Style                     |
-| ------------------------------ | ------------------------- |
-| Existing geometry              | black solid stroke        |
-| New construction lines/circles | red dashed stroke         |
-| Existing points                | black points              |
-| New points                     | red points or red markers |
+### Primitive-level diff
 
-This structure makes generated outputs easier to parse, render, inspect, and score.
-
----
-
-### 3. Primitive-Level Diff
-
-To identify newly added elements, the pipeline compares consecutive graph states:
-
-```text
-prev_keys = primitives(step_i)
-curr_keys = primitives(step_i+1)
-new_keys  = curr_keys - prev_keys
-```
-
-Primitive keys are defined by point names rather than object identity, so that graph rebuilds and object-address changes do not produce false positives:
+New elements between consecutive steps are detected by set difference over point-name keys, not object identity:
 
 ```text
 Point   = point name
@@ -179,418 +105,95 @@ Circle  = frozenset(point names)
 Segment = frozenset(point names)
 ```
 
+This avoids false positives from graph rebuilds.
+
+### What broke, and what we shipped
+
+SFT on NeMo-RL for a VLM turned into a practical PEFT case study:
+
+| Issue                                                                 | Fix                                                     |
+| --------------------------------------------------------------------- | ------------------------------------------------------- |
+| Training collapse (loss diverges or plateaus high)                    | Tuned LR, disabled LM-head LoRA, disabled vision-encoder LoRA |
+| Data mixture weighting, vision-encoder grad checkpointing, metric log | Code patches against NeMo-RL                            |
+
+The second training curve in the deck — the one that actually descends smoothly from 11.8 → 0 — is the run we used for the results below.
+
 ---
 
-### 4. Cold-Start SVG SFT
+## Stage 2 — RL: Rewards from Rendered Images
 
-Before applying RL, the model is trained on supervised data so that it can produce valid SVG-like outputs.
+For each Geometry3K problem, the policy produces 4 SVG candidates. Each candidate is rendered, then scored on three axes:
+
+### `R_render` — does it render?
 
 ```text
-Input  : partially drawn geometry image + edit instruction
-Output : semantic SVG target
+1 if the SVG parses and renders
+0 otherwise
 ```
 
-This stage reduces:
+Cheap, but critical: early RL collapses the moment candidates stop rendering.
 
-* invalid SVG outputs
-* render failures
-* unstructured token generation
-* reward collapse in early RL
+### `R_judge` — is it geometrically helpful?
 
----
-
-### 5. Geometry-Aware GRPO
-
-In the RL stage, the model generates multiple SVG auxiliary construction candidates per Geometry3K problem. Candidates within each group are compared under a three-layer reward suite:
+A judge model ranks the 4 candidates per problem on a 0–3 ordinal scale (3 = most helpful, 0 = least).
 
 ```text
-R_format      : SVG extraction / parsing / rendering validity
-R_geometry    : judge-based geometric quality
-R_solve_aux   : whether the augmented diagram helps solve the problem
+Judge model: Qwen 3.5 110B-A10B (served via OpenRouter)
 ```
 
----
+### `R_solve` — does it actually help solve the problem?
 
-## Data Construction
+A lightweight solver (Qwen 3.5 VL 9B) attempts each problem **twice** — once with the original figure, once with the auxiliary line overlaid:
 
-### Source Dataset
+| Outcome                                   | Score |
+| ----------------------------------------- | ----- |
+| Fails without aux, succeeds with aux      | **2** |
+| Same result either way                    | **1** |
+| Succeeds without aux, fails with aux      | **0** |
 
-SFT data is built from **MathCanvas-Edit**, specifically the `foundational_structure_generation` subset. Each row contains a step-wise construction trajectory:
+### Aggregate
 
 ```text
-id
-seed
-base_caption
-code_list
-instruction_list
-image_list
+Loss  =  R_render  +  R_judge  +  R_solve
 ```
-
-The key transition is `code_list[i] + instruction_list[i] → code_list[i+1]`.
 
 ---
 
-### Renderer Choice
+## Results
 
-The pipeline uses the original MathCanvas `foundations_synthesis` renderer rather than newclid, because:
+### SFT — geometric structure emerges
 
-* MathCanvas and newclid use different construction dialects.
-* newclid renders with visually incompatible styles.
-* Primitive extraction differs between the two and may fail to reproduce the original diagram.
-* The MathCanvas renderer preserves the dataset's labels, layout, line styles, and right-angle marks.
+**Result 1** — *Let ABC be an equilateral triangle. Construct point F by rotating D 90° clockwise around B.*
+The prediction correctly places F outside the triangle via a red dashed segment from the B-side vertex, matching the GT construction direction.
 
----
+**Result 2** — *Let ABC be a right triangle with right angle at A. Construct D, E on AC such that BD, BE trisect angle ABC.*
+Prediction draws two red dashed cevians from the apex down to two interior points on the base — the trisection structure is correct, though with a different base orientation than the GT.
 
-### Generating LLaVA-Style SVG SFT Data
+### SFT — quantitative progression
 
-```bash
-cd $PROJECT_ROOT/sft-data
+LPIPS against GT rendering, n=32 on `train_00500.jsonl`, greedy decoding, alex@512:
 
-python make_sft_1k_llava.py
-```
+| Step | LPIPS (all) | LPIPS (render_ok only) | render_ok rate    |
+| ---- | ----------- | ---------------------- | ----------------- |
+| 10   | 0.5300      | 0.4628                 | 28/32 (87.5%)     |
+| 20   | **0.4846**  | **0.4503**             | 30/32 (93.8%)     |
+| 30   | 0.5579      | 0.4760                 | 27/32 (84.4%)     |
+| 40   | 0.4883      | 0.4718                 | **31/32 (96.9%)** |
 
-Output layout:
+Key observation: **loss and LPIPS are not monotonically aligned** with checkpoint step. Step 30 has the lowest render_ok rate despite being later in training. This is why we validate every checkpoint with render + LPIPS probes, not loss alone.
+
+### Geometry3K inference baseline
+
+Measured on `hiyouga/geometry3k` train `[0:50]` using the original problem images (no aux lines yet):
 
 ```text
-sft_llava_1k/
-├── train.json
-├── train.jsonl
-├── images/
-├── preview/
-│   ├── sample_000.json
-│   ├── sample_000.png
-│   └── sample_000_target.svg
-└── failures.jsonl
+Total samples:                     50
+Valid predictions:                 46
+Correct:                           31
+API errors:                         4
+Accuracy over all samples:       62.0%
+Accuracy over valid predictions: 67.4%
+Valid answer rate:               92.0%
 ```
 
-Each training sample uses a LLaVA-style format:
-
-```json
-{
-  "id": "source_id/edit_0",
-  "image": "images/source_id_edit_0.png",
-  "conversations": [
-    {
-      "from": "human",
-      "value": "<image>\nYou are given a partially-drawn geometric diagram..."
-    },
-    {
-      "from": "gpt",
-      "value": "<svg>...</svg>"
-    }
-  ]
-}
-```
-
----
-
-## Training
-
-### Cold-Start SFT
-
-SFT uses **Nemotron Nano 12B v2 VL** with **LoRA** on top of NeMo-RL v0.5.0.
-
-Smoke-test configuration:
-
-```text
-Model:      Nemotron Nano 12B v2 VL
-Framework:  NeMo-RL v0.5.0
-Method:     LoRA SFT
-LoRA dim:   8
-Hardware:   1 × H100 PCIe
-Smoke data: 200 samples
-Steps:      20
-```
-
-Run:
-
-```bash
-cd $PROJECT_ROOT/nemo-RL-v0.5.0
-
-uv run python examples/run_vlm_sft.py \
-  --config examples/configs/sft_vlm_nemotron_nano_v2_llava_smoke.yaml
-```
-
-or simply:
-
-```bash
-./run_real.sh
-```
-
----
-
-### Checkpointing
-
-LoRA checkpoints are saved periodically under:
-
-```text
-results/sft_nemotron_vl_lora/
-├── step_10/
-├── step_20/
-└── step_30/
-```
-
-Each checkpoint contains:
-
-```text
-config.yaml
-training_info.json
-train_dataloader.pt
-policy/
-  weights/
-  optimizer/
-```
-
----
-
-### LoRA Merge for Inference
-
-NeMo-RL checkpoints are not directly loadable by standard Hugging Face inference. The LoRA adapter must be merged into the base model and exported as a HuggingFace-compatible checkpoint:
-
-```bash
-DT=/opt/ray_venvs/nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2
-
-$DT/bin/python tools/inference/merge_lora_nemotron_vl.py \
-  --adapter-dir results/sft_nemotron_vl_lora/step_10/policy/weights/model \
-  --out-dir results/sft_nemotron_vl_lora/step_10_merged \
-  --device cuda:0
-```
-
-Merged output:
-
-```text
-step_10_merged/
-├── config.json
-├── model-00001-of-00006.safetensors
-├── ...
-├── model.safetensors.index.json
-├── tokenizer.json
-└── processor_config.json
-```
-
----
-
-## Geometry3K Inference Baseline
-
-The inference script evaluates a VLM on Geometry3K using original problem images:
-
-```bash
-cd $PROJECT_ROOT/inference
-
-python async_eval_geometry3k_friendli.py \
-  --dataset hiyouga/geometry3k \
-  --split train \
-  --limit 50 \
-  --mode original \
-  --concurrency 2 \
-  --max-retries 2 \
-  --max-tokens 2048 \
-  --out results_original_50.jsonl
-```
-
-Observed baseline on `hiyouga/geometry3k` train `[0:50]`:
-
-```text
-Total samples:                  50
-Valid predictions:              46
-Correct:                        31
-API errors:                     4
-Accuracy over all samples:      62.0%
-Accuracy over valid predictions:67.4%
-Valid answer rate:              92.0%
-```
-
-Input format:
-
-```text
-Image:    row["images"][0]
-Question: row["problem"]
-Answer:   row["answer"]
-```
-
----
-
-## GRPO / RL
-
-### Objective
-
-The RL stage prompts the model to generate SVG auxiliary constructions for Geometry3K problems:
-
-```text
-Input:  Geometry problem image + text prompt
-Output: SVG auxiliary construction
-```
-
-The SVG is rendered and evaluated under the reward suite.
-
----
-
-### Run Scripts
-
-| Script             | Purpose             |
-| ------------------ | ------------------- |
-| `run_rl.sh`        | Warm-started run    |
-| `run_rl_base.sh`   | Base-model run      |
-| `run_rl_smoke.sh`  | Smoke test          |
-
-GRPO configuration:
-
-```text
-num_prompts_per_step       = 3
-num_generations_per_prompt = 4
-rollouts per step          = 12
-train_global_batch_size    = 12
-GPUs                       = 6
-parallelism                = pure DP
-```
-
----
-
-### Reward Components
-
-```text
-1. Format reward
-   - Can the SVG be extracted?
-   - Can it be parsed?
-   - Can it be rendered?
-
-2. Geometry / judge reward
-   - Are the added constructions geometrically meaningful?
-   - Are they aligned with the problem?
-
-3. Solve-after-aux reward
-   - Does the augmented diagram improve solving accuracy?
-```
-
----
-
-## Hardware Notes
-
-The training node uses 8 × H100 PCIe GPUs, but intra-node topology is constrained:
-
-```text
-NVLink pairs:
-  GPU 0-1
-  GPU 2-3
-  GPU 4-5
-  GPU 6-7
-
-Cross-pair communication:
-  PCIe / PHB
-```
-
-Large TP/PP configurations across all 8 GPUs are therefore suboptimal. The project uses conservative settings:
-
-* single-GPU LoRA SFT for smoke validation
-* TP=2 only within an NVLink pair for vLLM inference
-* pure DP for GRPO where possible
-* NCCL flags to avoid unsupported P2P paths
-
-Example environment flags:
-
-```bash
-NCCL_P2P_DISABLE=1
-NCCL_SHM_DISABLE=1
-NCCL_DEBUG=WARN
-PYTORCH_ALLOC_CONF=expandable_segments:True
-```
-
----
-
-## Quick Start
-
-### 1. Build SVG SFT data
-
-```bash
-cd $PROJECT_ROOT/sft-data
-python make_sft_1k_llava.py
-```
-
-Preview samples:
-
-```bash
-open sft_llava_1k/preview/sample_000.png
-open sft_llava_1k/preview/sample_000_target.svg
-cat sft_llava_1k/preview/sample_000.json
-```
-
----
-
-### 2. Run SFT smoke training
-
-```bash
-cd $PROJECT_ROOT/nemo-RL-v0.5.0
-./run_real.sh
-```
-
-Monitor:
-
-```bash
-tail -F logs/*.log | grep -E "Step |Validation|Error|Killed"
-```
-
----
-
-### 3. Run Geometry3K inference baseline
-
-```bash
-cd $PROJECT_ROOT/inference
-
-python async_eval_geometry3k_friendli.py \
-  --dataset hiyouga/geometry3k \
-  --split train \
-  --limit 50 \
-  --mode original \
-  --concurrency 2 \
-  --max-retries 2 \
-  --max-tokens 2048 \
-  --out results_original_50.jsonl
-```
-
----
-
-### 4. Run GRPO smoke test
-
-```bash
-cd $PROJECT_ROOT/nemo-RL-v0.5.0
-./run_rl_smoke.sh
-```
-
----
-
-## Environment Variables
-
-For Friendli inference:
-
-```bash
-FRIENDLI_API_KEY=...
-FRIENDLI_BASE_URL=https://api.friendli.ai/dedicated/v1
-FRIENDLI_MODEL=...
-```
-
-For judge-based reward / OpenRouter:
-
-```bash
-OPENROUTER_API_KEY=...
-```
-
-Do not commit `.env` files:
-
-```gitignore
-.env
-*.env
-```
-
-
----
-
-## Acknowledgements
-
-This project builds on:
-
-* NVIDIA NeMo-RL
-* NVIDIA Nemotron Nano VL
-* MathCanvas / MathCanvas-Edit
-* Geometry3K
-* LLaVA-style multimodal instruction tuning
-* vLLM and OpenAI-compatible inference APIs
+This is the baseline ΔG2U is measured against.
