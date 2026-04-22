@@ -1,0 +1,114 @@
+commit a02ec2be7f7cc08ea1e0e65041439fcbc8f469f3
+Author: Chanwoo <99chanwoo@gmail.com>
+Date:   Mon Apr 20 08:04:29 2026 +0000
+
+    [sprint6-nodeA] T2 Sprint-6 integration (Phase 2.3-2.6)
+    
+    Four files touched — wires r_judge/r_solve into NeMo-RL training loop.
+    
+    1. nemo_rl/data/datasets/response_datasets/geometry3k.py
+       - format_geometry3k_dataset now emits ground_truth as JSON envelope:
+         {'question', 'image_b64', 'answer', '_format': 'sprint6_v1'}
+       - Image is base64-encoded PNG (self-contained, no file I/O per sample)
+       - Backward-compatible: Sprint-5 per-sample rewards ignore envelope
+    
+    2. nemo_rl/environments/rewards.py
+       - _BATCH_REWARD_NAMES = {'svg_judge_group', 'svg_solve_aux'}
+       - _parse_gt_payload: safe JSON envelope parser (None if not v1 format)
+       - _run_group_calls: shared async runner — groups indices by gt string,
+         fires ALL groups concurrently via single asyncio.gather (PLAN C.4
+         fire-all-gather), scatters back to original positions
+       - svg_judge_group_scores + svg_solve_aux_scores: batch-level adapters
+         with graceful degrade to [0]*n on any exception
+    
+    3. nemo_rl/environments/vlm_environment.py
+       - VLMVerifyWorker.__init__ now separates per-sample pairs from batch pairs
+       - verify() does per-sample loop first, then one call per batch reward
+         (NOT one call per group — batch reward internally groups)
+       - Joint renormalization: weighted sum / total_weight for final score
+       - No-batch case keeps Sprint-5 behavior exactly (verify_func unchanged)
+    
+    4. examples/configs/grpo_geometry3k_judge.yaml (NEW)
+       - Inherits grpo_geometry3k.yaml (Sprint-5 winner)
+       - Overrides: max_input 4096 (C.2), max_total 6144 (C.12 mem budget),
+         max_new 1024, save_period 5, max_num_steps 25 (PoC)
+       - Reward mix: fmt=0.2, judge=0.4, solve=0.4 (static, no curriculum yet)
+       - TODO: wire reward_schedule curriculum (C.3) — left for Phase 2
+         follow-up; current behavior uses static weights throughout
+    
+    Import smoke test passes (no circular imports, _parse_gt_payload correct).
+    No full-run smoke yet — that's T3.
+    
+    Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+
+diff --git a/nemo_rl/data/datasets/response_datasets/geometry3k.py b/nemo_rl/data/datasets/response_datasets/geometry3k.py
+index 429decb5..53ae87f4 100644
+--- a/nemo_rl/data/datasets/response_datasets/geometry3k.py
++++ b/nemo_rl/data/datasets/response_datasets/geometry3k.py
+@@ -12,6 +12,9 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import base64
++import io
++import json
+ from typing import Any
+ 
+ from datasets import load_dataset
+@@ -20,14 +23,31 @@ from nemo_rl.data.datasets.raw_dataset import RawDataset
+ from nemo_rl.data.datasets.utils import pil_to_base64
+ 
+ 
++def _image_to_png_b64(img) -> str:
++    """PIL image -> base64-encoded PNG string. Stable, deterministic."""
++    buf = io.BytesIO()
++    img.convert("RGB").save(buf, format="PNG")
++    return base64.b64encode(buf.getvalue()).decode("ascii")
++
++
+ def format_geometry3k_dataset(
+     example: dict[str, Any], return_pil: bool = False
+ ) -> dict[str, Any]:
+-    """Format the Geometry3K dataset into an OpenAI-API-like message log."""
++    """Format the Geometry3K dataset into an OpenAI-API-like message log.
++
++    Sprint-6 change: assistant_content is now a JSON string containing
++    {"question", "image_b64", "answer"} so group-aware rewards (svg_judge_group,
++    svg_solve_aux_scores) can access the original problem image and gold answer
++    at reward-compute time. Sprint-5 per-sample rewards (svg_format,
++    svg_geometric) ignore the JSON envelope and still work on response string
++    alone.
++    """
+     # isolate single image
+     if isinstance(example["images"], list):
+         example["image"] = example["images"][0]
+ 
++    problem_text = str(example["problem"]).replace("<image>", "")
++
+     user_content = [
+         {
+             "type": "image",
+@@ -37,11 +57,21 @@ def format_geometry3k_dataset(
+         },
+         {
+             "type": "text",
+-            "text": str(example["problem"]).replace("<image>", ""),
++            "text": problem_text,
+         },
+     ]
+ 
+-    assistant_content = str(example["answer"])
++    # Sprint-6 ground-truth envelope. Kept minimal; adapters parse by key.
++    # The string must stay compact — it ends up in DatumSpec.extra_env_info,
++    # replicated per rollout. ~20-70 KB per sample is tolerable for 16-rollout batches.
++    answer = str(example["answer"])
++    gt_payload = {
++        "question": problem_text,
++        "image_b64": _image_to_png_b64(example["image"]),
++        "answer": answer,
++        "_format": "sprint6_v1",   # version tag; adapters assert this
++    }
++    assistant_content = json.dumps(gt_payload)
+ 
+     ret = {
+         "messages": [

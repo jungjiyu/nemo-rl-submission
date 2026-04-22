@@ -1,0 +1,197 @@
+commit a02ec2be7f7cc08ea1e0e65041439fcbc8f469f3
+Author: Chanwoo <99chanwoo@gmail.com>
+Date:   Mon Apr 20 08:04:29 2026 +0000
+
+    [sprint6-nodeA] T2 Sprint-6 integration (Phase 2.3-2.6)
+    
+    Four files touched — wires r_judge/r_solve into NeMo-RL training loop.
+    
+    1. nemo_rl/data/datasets/response_datasets/geometry3k.py
+       - format_geometry3k_dataset now emits ground_truth as JSON envelope:
+         {'question', 'image_b64', 'answer', '_format': 'sprint6_v1'}
+       - Image is base64-encoded PNG (self-contained, no file I/O per sample)
+       - Backward-compatible: Sprint-5 per-sample rewards ignore envelope
+    
+    2. nemo_rl/environments/rewards.py
+       - _BATCH_REWARD_NAMES = {'svg_judge_group', 'svg_solve_aux'}
+       - _parse_gt_payload: safe JSON envelope parser (None if not v1 format)
+       - _run_group_calls: shared async runner — groups indices by gt string,
+         fires ALL groups concurrently via single asyncio.gather (PLAN C.4
+         fire-all-gather), scatters back to original positions
+       - svg_judge_group_scores + svg_solve_aux_scores: batch-level adapters
+         with graceful degrade to [0]*n on any exception
+    
+    3. nemo_rl/environments/vlm_environment.py
+       - VLMVerifyWorker.__init__ now separates per-sample pairs from batch pairs
+       - verify() does per-sample loop first, then one call per batch reward
+         (NOT one call per group — batch reward internally groups)
+       - Joint renormalization: weighted sum / total_weight for final score
+       - No-batch case keeps Sprint-5 behavior exactly (verify_func unchanged)
+    
+    4. examples/configs/grpo_geometry3k_judge.yaml (NEW)
+       - Inherits grpo_geometry3k.yaml (Sprint-5 winner)
+       - Overrides: max_input 4096 (C.2), max_total 6144 (C.12 mem budget),
+         max_new 1024, save_period 5, max_num_steps 25 (PoC)
+       - Reward mix: fmt=0.2, judge=0.4, solve=0.4 (static, no curriculum yet)
+       - TODO: wire reward_schedule curriculum (C.3) — left for Phase 2
+         follow-up; current behavior uses static weights throughout
+    
+    Import smoke test passes (no circular imports, _parse_gt_payload correct).
+    No full-run smoke yet — that's T3.
+    
+    Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+
+diff --git a/nemo_rl/environments/vlm_environment.py b/nemo_rl/environments/vlm_environment.py
+index 956608c1..ef3b6e6c 100644
+--- a/nemo_rl/environments/vlm_environment.py
++++ b/nemo_rl/environments/vlm_environment.py
+@@ -30,6 +30,7 @@ from nemo_rl.environments.metrics import (
+     calculate_pass_rate_per_prompt,
+ )
+ from nemo_rl.environments.rewards import (
++    _BATCH_REWARD_NAMES,
+     bbox_giou_reward,
+     combine_reward_functions,
+     exact_answer_alphanumeric_reward,
+@@ -37,6 +38,8 @@ from nemo_rl.environments.rewards import (
+     math_expression_reward,
+     svg_format_reward,
+     svg_geometric_reward,
++    svg_judge_group_scores,
++    svg_solve_aux_scores,
+ )
+ from nemo_rl.environments.utils import chunk_list_to_workers
+ 
+@@ -61,14 +64,32 @@ def _mute_output():
+ class VLMVerifyWorker:
+     def __init__(self, cfg: VLMEnvConfig) -> None:
+         logging.getLogger("vlm_worker").setLevel(logging.CRITICAL)
+-        # this is a simple reward function that rewards the agent for correct answer and correct format
+-        reward_functions = []
+-        # loop over all configs
++        # Split reward functions into two kinds:
++        #   - per-sample: (gt, resp) -> (score, is_correct)
++        #   - batch-level (Sprint-6): (gts_list, resps_list) -> list[float]
++        # Batch-level rewards need the full group to compute (judge / pairwise solve).
++        reward_functions: list[tuple[Callable, float]] = []
++        batch_rewards: list[tuple[str, Callable[[list[str], list[str]], list[float]], float]] = []
++
+         for reward_func_cfg in cfg["reward_functions"]:
+-            # get name and weight
+             reward_func_name: str = reward_func_cfg["name"]
+             reward_func_weight: float = reward_func_cfg["weight"]
+             reward_func_kwargs: Optional[dict] = reward_func_cfg.get("kwargs", None)
++
++            if reward_func_name in _BATCH_REWARD_NAMES:
++                # Batch-level reward (Sprint-6). Stored separately; invoked in .verify() after per-sample.
++                if reward_func_name == "svg_judge_group":
++                    batch_fn = svg_judge_group_scores
++                elif reward_func_name == "svg_solve_aux":
++                    batch_fn = svg_solve_aux_scores
++                else:
++                    raise ValueError(f"Unknown batch reward: {reward_func_name}")
++                if reward_func_kwargs is not None:
++                    batch_fn = partial(batch_fn, **reward_func_kwargs)
++                batch_rewards.append((reward_func_name, batch_fn, reward_func_weight))
++                continue
++
++            # Per-sample reward (Sprint-5 and earlier)
+             reward_func: Callable[[str, str], tuple[float, Optional[bool]]]
+             if reward_func_name == "format":
+                 reward_func = format_reward
+@@ -85,43 +106,79 @@ class VLMVerifyWorker:
+             else:
+                 raise ValueError(f"Invalid reward function: {reward_func_name}")
+ 
+-            # check for additional kwargs
+             if reward_func_kwargs is not None:
+                 reward_func = partial(reward_func, **reward_func_kwargs)
+ 
+             reward_functions.append((reward_func, reward_func_weight))
+ 
+-        if len(reward_functions) == 0:
++        if len(reward_functions) == 0 and len(batch_rewards) == 0:
+             raise ValueError("No reward functions provided")
+ 
+-        # combine the reward functions
+-        self.verify_func = combine_reward_functions(reward_functions)
++        # Weighting: combine_reward_functions renormalizes internally, but with
++        # batch rewards in the mix, we need a combined renormalization. Keep
++        # per-sample weights as-given, and renormalize at the fuse step in verify().
++        self.per_sample_pairs = reward_functions              # already (fn, weight) tuples
++        self.batch_pairs = batch_rewards                      # (name, fn, weight)
++        # Precompute normalized weights for the fuse (per-sample + batch together).
++        all_weights = [w for _, w in reward_functions] + [w for _, _, w in batch_rewards]
++        total = sum(all_weights)
++        if total <= 0:
++            raise ValueError("Reward function weights sum to zero")
++        self._weight_norm = total
++
++        # combined fn for per-sample only (used when no batch rewards present — keeps Sprint-5 behavior).
++        self.verify_func = combine_reward_functions(reward_functions) if reward_functions else None
+ 
+     def verify(
+         self, pred_responses: list[str], ground_truths: list[str]
+     ) -> list[float]:
+         """Verify the correctness of the predicted responses against the ground truth.
+ 
++        Sprint-6 behavior: per-sample rewards (e.g. svg_format, svg_geometric) are computed
++        first, then batch-level rewards (svg_judge_group, svg_solve_aux) are called once
++        over the entire batch. Final per-response reward is the weighted sum of both.
++
+         Args:
+             pred_responses: list[str]. The predicted responses from the LLM.
+-            ground_truths: list[str]. The ground truth responses.
++            ground_truths: list[str]. The ground truth strings (Sprint-6: JSON envelope).
+ 
+         Returns:
+-            list[float]. The rewards for each predicted response.
++            list[float]. The rewards for each predicted response (weighted sum, renormalized).
+         """
+-        results = []
+-        for response, ground_truth in zip(pred_responses, ground_truths):
+-            try:
+-                with _mute_output():
++        n = len(pred_responses)
++        # Per-sample rewards: each (response, gt) → (weighted_score, is_correct)
++        # We skip the built-in renormalization in combine_reward_functions and
++        # apply our joint normalization (per-sample + batch).
++        per_sample_accum = [0.0] * n
++        if self.per_sample_pairs:
++            for reward_func, w in self.per_sample_pairs:
++                for i, (response, gt) in enumerate(zip(pred_responses, ground_truths)):
+                     try:
+-                        ret_score, _ = self.verify_func(ground_truth, response)
++                        with _mute_output():
++                            s, _ = reward_func(gt, response)
++                        per_sample_accum[i] += float(s) * w
+                     except Exception as e:
+-                        ret_score = 0.0
+-                        print(f"Error in verify_func: {e}")
+-                results.append(float(ret_score))
++                        print(f"Error in per-sample reward {reward_func}: {e}")
++
++        # Batch rewards: one call per reward, returns list[float] per response
++        batch_accum = [0.0] * n
++        for name, batch_fn, w in self.batch_pairs:
++            try:
++                scores = batch_fn(ground_truths, pred_responses)
+             except Exception as e:
+-                print(f"Error in verify: {e}")
+-                results.append(0.0)
++                print(f"Error in batch reward {name}: {e}")
++                scores = [0.0] * n
++            if len(scores) != n:
++                print(f"Batch reward {name} returned {len(scores)} scores for {n} responses — zeroing")
++                scores = [0.0] * n
++            for i, s in enumerate(scores):
++                batch_accum[i] += float(s) * w
++
++        # Fuse and normalize by total weight
++        results = [
++            (per_sample_accum[i] + batch_accum[i]) / self._weight_norm
++            for i in range(n)
++        ]
+         return results
+ 
+ 

@@ -1,0 +1,155 @@
+commit 6a8d524e9564d93170232e218e260c278b0ffaf5
+Author: Chanwoo <99chanwoo@gmail.com>
+Date:   Mon Apr 20 09:02:18 2026 +0000
+
+    [sprint6-nodeA] C.10 silent-masking assertions in grpo.py (vanilla path)
+    
+    Inserted at line ~1776 before advantage_calculation:
+    - Monitors loss_multiplier mean (should be > 0.5)
+    - Monitors pct_allzero_groups (should be < 95%)
+    - Logs per-step: step | loss_mult_mean | n_rollouts | reward_mean |
+      reward_var | pct_allzero_groups | min_group_std
+    - Fails LOUD (AssertionError) if either assertion violates
+    - Wrapped in try/except so instrumentation bugs don't kill training
+    - NRL_DISABLE_C10_ASSERTS=1 env var to bypass
+    
+    Sprint-5 was silently broken for 3 days because max_input_seq_length=2048
+    masked 28.5% of samples via loss_multiplier=0.0, with NO log message.
+    This assertion catches that pattern + the 'all-zero-group' collapse
+    pattern at step 1, not day 3.
+    
+    Only applied to the vanilla GRPO path (~line 1776). The async/DAPO path
+    (~line 2826) has the same structure and would benefit — defer until
+    Sprint-6-B (DAPO ablation) when that code path becomes active.
+    
+    Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+
+diff --git a/nemo_rl/algorithms/grpo.py b/nemo_rl/algorithms/grpo.py
+index 682a4e14..54f205fd 100644
+--- a/nemo_rl/algorithms/grpo.py
++++ b/nemo_rl/algorithms/grpo.py
+@@ -1773,6 +1773,49 @@ def grpo_train(
+                         ],
+                     )
+ 
++                # === Sprint-6 C.10: silent-masking fail-loud assertions ===
++                # Sprint-5 was silently broken for 3 days (28.5% of samples masked via
++                # loss_multiplier=0.0 from max_input_seq_length truncation, no log).
++                # Fails LOUD at step 1 rather than let training silently underperform.
++                # Set NRL_DISABLE_C10_ASSERTS=1 to bypass (not recommended).
++                if not os.environ.get("NRL_DISABLE_C10_ASSERTS"):
++                    try:
++                        import numpy as _np
++                        _lm = train_data.get("loss_multiplier")
++                        if hasattr(_lm, "cpu"):
++                            _lm_arr = _lm.cpu().numpy()
++                        elif _lm is not None:
++                            _lm_arr = _np.asarray(_lm)
++                        else:
++                            _lm_arr = _np.array([1.0])
++                        _lm_mean = float(_np.mean(_lm_arr))
++                        _rw = rewards.cpu().numpy() if hasattr(rewards, "cpu") else _np.asarray(rewards)
++                        _ng = master_config["grpo"]["num_generations_per_prompt"]
++                        _np_ = _rw.shape[0] // _ng if _ng > 0 else 1
++                        _groups = _rw[: _np_ * _ng].reshape(_np_, _ng) if _np_ > 0 else _rw.reshape(1, -1)
++                        _pct_allzero_groups = float((_groups == 0).all(axis=1).mean()) if _groups.size else 1.0
++                        _group_stds = _groups.std(axis=1) if _groups.size else _np.zeros(1)
++                        _min_group_std = float(_group_stds.min()) if len(_group_stds) else 0.0
++                        print(
++                            f"[C.10 monitor] step={total_steps} loss_mult_mean={_lm_mean:.3f} "
++                            f"n_rollouts={len(_rw)} reward_mean={_rw.mean():.3f} "
++                            f"reward_var={float(_rw.var()):.3f} "
++                            f"pct_allzero_groups={_pct_allzero_groups:.2%} "
++                            f"min_group_std={_min_group_std:.3f}",
++                            flush=True,
++                        )
++                        assert _lm_mean > 0.5, (
++                            f"C.10: step {total_steps}: loss_multiplier mean={_lm_mean:.3f} < 0.5 — "
++                            f"too many samples silently masked. Check max_input_seq_length vs actual input_lengths."
++                        )
++                        assert _pct_allzero_groups < 0.95, (
++                            f"C.10: step {total_steps}: {_pct_allzero_groups:.0%} of groups have all-zero reward — signal collapsed."
++                        )
++                    except AssertionError:
++                        raise
++                    except Exception as _e:
++                        print(f"[C.10 monitor] instrumentation failed (non-fatal): {_e}", flush=True)
++
+                 # Compute advantages with adv_estimator using correct mask and logprobs
+                 with timer.time("advantage_calculation"):
+                     print("▶ Computing advantages...", flush=True)
+
+commit c4dc6cf76873bbce426d05a4bf4d64d98e224b62
+Author: Chanwoo <99chanwoo@gmail.com>
+Date:   Mon Apr 20 09:48:46 2026 +0000
+
+    [sprint6-nodeA] C.10 assertions on async/DAPO path too (Sprint-6-B prep)
+    
+    Same assertion set as vanilla path (line ~1776):
+    - loss_mult_mean > 0.5
+    - pct_allzero_groups < 0.95
+    - Per-step log: loss_mult / reward_mean+var / group_std
+    
+    Labeled '[C.10 monitor/async]' in log so grep differentiates paths.
+    Future Sprint-6-B (DAPO) runs will hit this code path.
+    
+    eval_judge_ensemble.py fixture test passed on Sprint-5 step_50
+    sample 1: all 3 judges rated aux as ungrounded (qwen122b=0,
+    qwen9b=0, glm=2) with consistent rationales ('blurry crosshair',
+    'nonsensical red blocks', 'not anchored'). Confirms Part C.12's
+    predicted failure mode pre-hackathon — writeup-worthy.
+    
+    Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+
+diff --git a/nemo_rl/algorithms/grpo.py b/nemo_rl/algorithms/grpo.py
+index 54f205fd..0527c0d0 100644
+--- a/nemo_rl/algorithms/grpo.py
++++ b/nemo_rl/algorithms/grpo.py
+@@ -2863,6 +2863,47 @@ def async_grpo_train(
+                         ],
+                     )
+ 
++                # === Sprint-6 C.10: silent-masking fail-loud assertions (async/DAPO path) ===
++                # Sprint-5 was silently broken for 3 days due to loss_multiplier=0.0 masking.
++                # Same assertion set as the vanilla path at ~line 1776 — catches same failure modes.
++                if not os.environ.get("NRL_DISABLE_C10_ASSERTS"):
++                    try:
++                        import numpy as _np
++                        _lm = train_data.get("loss_multiplier")
++                        if hasattr(_lm, "cpu"):
++                            _lm_arr = _lm.cpu().numpy()
++                        elif _lm is not None:
++                            _lm_arr = _np.asarray(_lm)
++                        else:
++                            _lm_arr = _np.array([1.0])
++                        _lm_mean = float(_np.mean(_lm_arr))
++                        _rw = rewards.cpu().numpy() if hasattr(rewards, "cpu") else _np.asarray(rewards)
++                        _ng = master_config["grpo"]["num_generations_per_prompt"]
++                        _np_ = _rw.shape[0] // _ng if _ng > 0 else 1
++                        _groups = _rw[: _np_ * _ng].reshape(_np_, _ng) if _np_ > 0 else _rw.reshape(1, -1)
++                        _pct_allzero_groups = float((_groups == 0).all(axis=1).mean()) if _groups.size else 1.0
++                        _group_stds = _groups.std(axis=1) if _groups.size else _np.zeros(1)
++                        _min_group_std = float(_group_stds.min()) if len(_group_stds) else 0.0
++                        print(
++                            f"[C.10 monitor/async] step={step} loss_mult_mean={_lm_mean:.3f} "
++                            f"n_rollouts={len(_rw)} reward_mean={_rw.mean():.3f} "
++                            f"reward_var={float(_rw.var()):.3f} "
++                            f"pct_allzero_groups={_pct_allzero_groups:.2%} "
++                            f"min_group_std={_min_group_std:.3f}",
++                            flush=True,
++                        )
++                        assert _lm_mean > 0.5, (
++                            f"C.10/async: step {step}: loss_multiplier mean={_lm_mean:.3f} < 0.5 — "
++                            f"too many samples silently masked. Check max_input_seq_length."
++                        )
++                        assert _pct_allzero_groups < 0.95, (
++                            f"C.10/async: step {step}: {_pct_allzero_groups:.0%} all-zero groups — signal collapsed."
++                        )
++                    except AssertionError:
++                        raise
++                    except Exception as _e:
++                        print(f"[C.10 monitor/async] instrumentation failed (non-fatal): {_e}", flush=True)
++
+                 # Compute advantages with adv_estimator using correct mask and logprobs
+                 with timer.time("advantage_calculation"):
+                     print("▶ Computing advantages...", flush=True)

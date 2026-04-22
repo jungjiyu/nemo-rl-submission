@@ -1,0 +1,176 @@
+commit a02ec2be7f7cc08ea1e0e65041439fcbc8f469f3
+Author: Chanwoo <99chanwoo@gmail.com>
+Date:   Mon Apr 20 08:04:29 2026 +0000
+
+    [sprint6-nodeA] T2 Sprint-6 integration (Phase 2.3-2.6)
+    
+    Four files touched — wires r_judge/r_solve into NeMo-RL training loop.
+    
+    1. nemo_rl/data/datasets/response_datasets/geometry3k.py
+       - format_geometry3k_dataset now emits ground_truth as JSON envelope:
+         {'question', 'image_b64', 'answer', '_format': 'sprint6_v1'}
+       - Image is base64-encoded PNG (self-contained, no file I/O per sample)
+       - Backward-compatible: Sprint-5 per-sample rewards ignore envelope
+    
+    2. nemo_rl/environments/rewards.py
+       - _BATCH_REWARD_NAMES = {'svg_judge_group', 'svg_solve_aux'}
+       - _parse_gt_payload: safe JSON envelope parser (None if not v1 format)
+       - _run_group_calls: shared async runner — groups indices by gt string,
+         fires ALL groups concurrently via single asyncio.gather (PLAN C.4
+         fire-all-gather), scatters back to original positions
+       - svg_judge_group_scores + svg_solve_aux_scores: batch-level adapters
+         with graceful degrade to [0]*n on any exception
+    
+    3. nemo_rl/environments/vlm_environment.py
+       - VLMVerifyWorker.__init__ now separates per-sample pairs from batch pairs
+       - verify() does per-sample loop first, then one call per batch reward
+         (NOT one call per group — batch reward internally groups)
+       - Joint renormalization: weighted sum / total_weight for final score
+       - No-batch case keeps Sprint-5 behavior exactly (verify_func unchanged)
+    
+    4. examples/configs/grpo_geometry3k_judge.yaml (NEW)
+       - Inherits grpo_geometry3k.yaml (Sprint-5 winner)
+       - Overrides: max_input 4096 (C.2), max_total 6144 (C.12 mem budget),
+         max_new 1024, save_period 5, max_num_steps 25 (PoC)
+       - Reward mix: fmt=0.2, judge=0.4, solve=0.4 (static, no curriculum yet)
+       - TODO: wire reward_schedule curriculum (C.3) — left for Phase 2
+         follow-up; current behavior uses static weights throughout
+    
+    Import smoke test passes (no circular imports, _parse_gt_payload correct).
+    No full-run smoke yet — that's T3.
+    
+    Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+
+diff --git a/nemo_rl/environments/rewards.py b/nemo_rl/environments/rewards.py
+index e4a90df9..c9c337fc 100644
+--- a/nemo_rl/environments/rewards.py
++++ b/nemo_rl/environments/rewards.py
+@@ -179,6 +179,128 @@ def svg_geometric_reward(
+         return 0.0, None
+ 
+ 
++# ===== Sprint-6 group-aware batch rewards (judge + solve_aux) =====
++# Unlike per-sample rewards above, these take (gts_list, responses_list) at once and
++# return list[float] in the SAME ORDER as the input. They group by ground_truth (same
++# gt = same GRPO group, judged jointly by a VL model).
++
++_BATCH_REWARD_NAMES = frozenset({"svg_judge_group", "svg_solve_aux"})
++
++
++def _parse_gt_payload(gt: str) -> Optional[dict]:
++    """Parse Sprint-6 ground-truth JSON. Returns None if gt is not the v1 envelope."""
++    import json
++    try:
++        d = json.loads(gt)
++    except Exception:
++        return None
++    if not isinstance(d, dict) or d.get("_format") != "sprint6_v1":
++        return None
++    for k in ("question", "image_b64", "answer"):
++        if k not in d:
++            return None
++    return d
++
++
++def _group_by_gt(gts: list[str], responses: list[str]) -> tuple[dict[str, list[int]], list[Optional[dict]]]:
++    """Group indices by ground_truth string. Returns (groups_map, parsed_payloads).
++    groups_map[gt_string] = [list of sample indices with that gt].
++    parsed_payloads[i] = parsed JSON dict (or None if not sprint6_v1 format — sample skipped).
++    """
++    groups: dict[str, list[int]] = {}
++    parsed: list[Optional[dict]] = []
++    for i, gt in enumerate(gts):
++        pd = _parse_gt_payload(gt)
++        parsed.append(pd)
++        if pd is not None:
++            groups.setdefault(gt, []).append(i)
++    return groups, parsed
++
++
++def _hackathon_r_judge_r_solve():
++    """Lazy import of Sprint-6 group reward modules."""
++    import sys
++    proj = "/mnt/cmlssd004/public/chanwoo/hackaton/nemo-RL"
++    if proj not in sys.path:
++        sys.path.insert(0, proj)
++    from hackathon.rewards.r_judge import r_judge_group
++    from hackathon.rewards.r_solve import r_solve_group
++    return r_judge_group, r_solve_group
++
++
++def _run_group_calls(
++    gts: list[str], responses: list[str], group_call_async: Callable
++) -> list[float]:
++    """Common pattern for both judge and solve: group by gt, run async concurrent calls, scatter back.
++
++    group_call_async signature: async (client, question, image_bytes, responses_list, gold?) -> list[float]
++    (gold is passed iff the callable accepts 'gold_answer' — we introspect by calling with it; solve accepts, judge doesn't)
++    """
++    import asyncio
++    import base64
++    import httpx
++    import inspect
++
++    out = [0.0] * len(responses)
++    groups, parsed = _group_by_gt(gts, responses)
++    if not groups:
++        return out
++
++    takes_gold = "gold_answer" in inspect.signature(group_call_async).parameters
++
++    async def _runner():
++        async with httpx.AsyncClient(
++            limits=httpx.Limits(max_connections=128, max_keepalive_connections=64)
++        ) as client:
++            group_tasks = []
++            group_idx_list = []
++            for gt_str, idx_list in groups.items():
++                pd = parsed[idx_list[0]]
++                assert pd is not None
++                img_bytes = base64.b64decode(pd["image_b64"])
++                group_responses = [responses[i] for i in idx_list]
++                kwargs = dict(
++                    client=client,
++                    question=pd["question"],
++                    problem_image_png_bytes=img_bytes,
++                    responses=group_responses,
++                )
++                if takes_gold:
++                    kwargs["gold_answer"] = pd["answer"]
++                group_tasks.append(group_call_async(**kwargs))
++                group_idx_list.append(idx_list)
++            # Fire ALL groups concurrently — this is the fire-all-gather per PLAN C.4
++            group_scores_list = await asyncio.gather(*group_tasks, return_exceptions=True)
++            for idx_list, g_scores in zip(group_idx_list, group_scores_list):
++                if isinstance(g_scores, Exception):
++                    # graceful degrade: leave as 0.0 per PLAN A.7
++                    continue
++                for local_i, global_i in enumerate(idx_list):
++                    out[global_i] = float(g_scores[local_i])
++    asyncio.run(_runner())
++    return out
++
++
++def svg_judge_group_scores(ground_truths: list[str], responses: list[str]) -> list[float]:
++    """Batch-level Sprint-6 reward. Returns judge scores in [0,1] per response."""
++    try:
++        r_judge_group, _ = _hackathon_r_judge_r_solve()
++        return _run_group_calls(ground_truths, responses, r_judge_group)
++    except Exception as e:
++        print(f"[svg_judge_group_scores] fatal error → [0]*n: {e}")
++        return [0.0] * len(responses)
++
++
++def svg_solve_aux_scores(ground_truths: list[str], responses: list[str]) -> list[float]:
++    """Batch-level Sprint-6 reward. Returns scheme-B {0,1,2} per response."""
++    try:
++        _, r_solve_group = _hackathon_r_judge_r_solve()
++        return _run_group_calls(ground_truths, responses, r_solve_group)
++    except Exception as e:
++        print(f"[svg_solve_aux_scores] fatal error → [0]*n: {e}")
++        return [0.0] * len(responses)
++
++
+ def combine_reward_functions(
+     reward_functions: list[tuple[Callable[[str, str], tuple[float, bool]], float]],
+ ) -> Callable[[str, str], tuple[float, bool]]:

@@ -1,0 +1,119 @@
+# Smoke-test SFT for nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16 on LLaVA-Instruct-150K subset.
+# Adapted for NeMo-RL v0.5.0 (flat data keys: train_data_path / val_data_path).
+# Goal: confirm the VLM training loop runs end-to-end. Not for real training.
+defaults:
+  - sft.yaml
+
+sft:
+  max_num_epochs: 1
+  max_num_steps: 1000   # baseline speed probe: limits to ~20 steps instead of full epoch
+  val_period: 0
+  val_batches: 0
+  val_global_batch_size: 8
+  val_micro_batch_size: 1
+  val_at_start: false
+  val_at_end: false
+  seed: 42
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "/ephemeral/vuvlm/nemo-RL-v0.5.0/results/sft_lora"
+  metric_name: "train:loss"   # val 껐으니 train loss 기준 best
+  higher_is_better: false
+  keep_top_k: 20
+  save_period: 25
+  checkpoint_must_save_by: null
+
+policy:
+  model_name: "nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16"
+  tokenizer:
+    name: ${policy.model_name}
+    # MUST use the model's native jinja template — the inherited sft.yaml template
+    # is text-only and breaks on multimodal `content` lists.
+    chat_template: "default"
+    chat_template_kwargs: null
+  train_global_batch_size: 32
+  train_micro_batch_size: 1
+  max_total_sequence_length: 6144
+  precision: "bfloat16"
+
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 1.0e-4
+      weight_decay: 0.1
+      betas: [0.9, 0.95]
+      eps: 1e-5
+      foreach: False
+      fused: False
+
+  dtensor_cfg:
+    _v2: true
+    enabled: true
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+
+    # vuvlm-local [patch #8]: activation checkpointing on the RADIO ViT blocks.
+    # Values here become OS env vars inside the dtensor_v2 worker (flow:
+    # lm_policy.py:130 reads this dict -> passed as env_vars to worker runtime).
+    # See dtensor_policy_worker_v2.py patch #8 block for the consumer.
+    #   NRL_VISION_AC       "1" enable / "0" skip            (default "1")
+    #   NRL_VISION_AC_UNIT  blocks per checkpoint unit       (default "4")
+    #       1 -> 32 boundaries (max save, max overhead)
+    #       4 -> 8  boundaries (recommended)
+    #       8 -> 4  boundaries (less save, lowest overhead)
+    env_vars:
+      NRL_VISION_AC: "1"
+      NRL_VISION_AC_UNIT: "4"
+
+    lora_cfg:
+      enabled: true
+      match_all_linear: true
+      dim: 8
+      alpha: 32
+      dropout: 0.0
+      dropout_position: "post"
+      lora_A_init: "xavier"
+      use_triton: true
+
+  sequence_packing:
+    enabled: false
+
+  dynamic_batching:
+    enabled: true
+    train_mb_tokens: 6144
+    sequence_length_round: 64
+
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  add_bos: true
+  add_eos: true
+  add_generation_prompt: false
+  shuffle: true
+  num_workers: 4
+
+  dataset_name: openai_format
+  train_data_path: /ephemeral/vuvlm/sft-data/mix_v1/train_00000.jsonl
+  val_data_path: /ephemeral/vuvlm/sft-data/mix_v1/train_00000.jsonl  # val off, reuses train (never iterated)
+  chat_key: messages
+  system_key: null
+  system_prompt: null
+  tool_key: tools
+  use_preserving_dataset: false
+
+logger:
+  log_dir: /ephemeral/vuvlm/nemo-RL-v0.5.0/logs_sft_lora
+  wandb_enabled: false
+  tensorboard_enabled: true
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: true
+  tensorboard:
+    log_dir: tb_logs-logs_sft_lora
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1

@@ -1,0 +1,52 @@
+# Sprint-6-A: Sprint-5 recipe + Sprint-6 judge/solve rewards + B.0 seqlen fix.
+# NO DAPO yet (that's Sprint-6-B ablation, separate yaml).
+#
+# Inherits grpo_geometry3k.yaml (Sprint-5 winner) and overrides:
+#   - C.2 seqlen fix (max_input 2048→4096; max_total & max_new per C.12 mem budget)
+#   - Sprint-6 reward mix: fmt(0.2) + judge(0.4) + solve(0.4) with curriculum
+#   - Reduced max_num_steps (PoC)
+#
+# Usage:
+#   NRL_CONFIG=examples/configs/grpo_geometry3k_judge.yaml MAX_RETRIES=3 \
+#     bash run_train_with_retry.sh
+
+defaults: "grpo_geometry3k.yaml"
+
+grpo:
+  num_prompts_per_step: 4
+  num_generations_per_prompt: 4
+  max_num_steps: 25                # PoC; extend to 50 after G2 pass
+  val_period: 10
+  val_at_start: false
+  max_val_samples: 16
+  val_batch_size: 16
+
+checkpointing:
+  checkpoint_dir: results/vlm-grpo-geometry3k-judge
+  save_period: 5                   # step_5/10/15/20/25 for PoC
+  save_consolidated: true
+  single_rank_consolidation: true
+  v4_compatible: true
+
+policy:
+  # Memory-aware seqlen (4×A100 80GB). If T0 unlocks more headroom via FSDP
+  # sharding, bump these to 8192 / 2048.
+  max_total_sequence_length: 6144
+  generation:
+    max_new_tokens: 1024
+    vllm_cfg:
+      max_model_len: 6144
+
+data:
+  max_input_seq_length: 4096       # C.2 fix (was 2048; silently masked 28.5% of data)
+
+env:
+  geometry3k:
+    num_workers: 4
+    # Static reward weights — used outside curriculum window.
+    # Curriculum in `reward_schedule` is NOT yet wired (TODO node_A or node_B).
+    # Current behavior: always use these static weights.
+    reward_functions:
+      - { name: svg_format,       weight: 0.2 }
+      - { name: svg_judge_group,  weight: 0.4 }
+      - { name: svg_solve_aux,    weight: 0.4 }

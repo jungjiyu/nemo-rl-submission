@@ -1,0 +1,125 @@
+## Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import base64
+import io
+import json
+from typing import Any, Optional
+
+from datasets import load_dataset
+
+from nemo_rl.data.datasets.raw_dataset import RawDataset
+from nemo_rl.data.datasets.utils import pil_to_base64
+
+
+def _image_to_png_b64(img) -> str:
+    """PIL image → base64-encoded PNG string (deterministic)."""
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def format_geometry3k_dataset(
+    example: dict[str, Any], return_pil: bool = False
+) -> dict[str, Any]:
+    """Format the Geometry3K dataset into an OpenAI-API-like message log.
+
+    The assistant content is a JSON envelope `{question, image_b64, answer,
+    _format}` so group-aware batch rewards (svg_judge_group, svg_solve_aux) can
+    access the original problem image and gold answer at reward-compute time.
+    Per-sample rewards (svg_format) ignore the envelope and work on the model
+    response string alone.
+    """
+    # isolate single image
+    example["image"] = (
+        example["images"][0]
+        if isinstance(example["images"], list)
+        else example["images"]
+    )
+
+    problem_text = str(example["problem"]).replace("<image>", "")
+
+    user_content = [
+        {
+            "type": "image",
+            "image": pil_to_base64(example["image"])
+            if not return_pil
+            else example["image"],
+        },
+        {
+            "type": "text",
+            "text": problem_text,
+        },
+    ]
+
+    # Ground-truth envelope. Kept minimal; batch-reward adapters parse by key.
+    # The string lands in DatumSpec.extra_env_info and is replicated per rollout;
+    # ~20-70 KB per sample × N rollouts is the memory cost.
+    gt_payload = {
+        "question": problem_text,
+        "image_b64": _image_to_png_b64(example["image"]),
+        "answer": str(example["answer"]),
+        "_format": "sprint6_v1",
+    }
+    assistant_content = json.dumps(gt_payload)
+
+    ret = {
+        "messages": [
+            {"role": "user", "content": user_content},
+            {
+                "role": "assistant",
+                "content": assistant_content,
+            },
+        ],
+        "task_name": "geometry3k",
+    }
+    return ret
+
+
+def prepare_geometry3k_dataset(split: str = "train", task_name: str = "geometry3k"):
+    if split == "train":
+        tr_dataset = load_dataset("hiyouga/geometry3k")["train"]
+        val_dataset = load_dataset("hiyouga/geometry3k")["validation"]
+    else:
+        tr_dataset = load_dataset("hiyouga/geometry3k")[split]
+        val_dataset = load_dataset("hiyouga/geometry3k")[split]
+
+    # format - disable features to avoid schema conflicts
+    tr_dataset = tr_dataset.add_column("task_name", [task_name] * len(tr_dataset))
+    val_dataset = val_dataset.add_column("task_name", [task_name] * len(val_dataset))
+    return {
+        "train": tr_dataset,
+        "validation": val_dataset,
+    }
+
+
+class Geometry3KDataset(RawDataset):
+    def __init__(
+        self,
+        split: str = "train",
+        prompt_file: Optional[str] = None,
+    ):
+        """Simple wrapper around the Geometry3K dataset.
+
+        Args:
+            split: The split of the dataset to use.
+            prompt_file: The file containing the prompt for the dataset.
+        """
+        assert split in ["train", "validation", "test"], (
+            f"Invalid split: {split}. Please use 'train' or 'validation' or 'test'."
+        )
+        self.task_name = "geometry3k"
+
+        self.formatted_ds = prepare_geometry3k_dataset(
+            split=split, task_name=self.task_name
+        )

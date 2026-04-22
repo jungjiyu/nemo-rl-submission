@@ -1,0 +1,34 @@
+# adapter: /ephemeral/vuvlm/nemo-RL-v0.5.0/results/sft_lora/step_25/policy/weights/model
+# probe_row_img: /ephemeral/vuvlm/sft-data/sft_llava_prod_foundational_jsonl/images/bin_00500/311379_edit_1.png
+# sampling: do_sample=True temp=1.0 top_k=20 max_new_tokens=1024
+# ==== full generation ====
+To extend the given geometric diagram according to the edit instruction, we need to construct points \\( G \\) and \\( H \\) that divide segment \\( AD \\) into three equal parts. We'll use an SVG to represent the diagram. Here's how we can do it step by step:
+
+1. **Identify Existing Geometry and Points**: The diagram includes the pentagon \\( ABCDE \\) with vertices \\( A, B, C, D, \\) and \\( E \\). Points \\( A \) and \\( D \\) are connected by the segment \\( AD \\).
+
+2. **Construct Points \\( G \\) and \\( H \\))**: We need to find the points that divide \\( AD \\) into three equal parts. This can be done by using the midpoint function or by constructing the bisectors if not already provided.
+
+3. **Emit the SVG**: We'll create an SVG that includes the pentagon \\( ABCDE \\), the segment \\( AD \\), and the newly-constructed points \\( G \\) and \\( H \\).
+
+Here is the SVG code that accomplishes this:
+
+```xml
+<svg width="300" height="200" xmlns="http://www.w3.org/2000/svg">
+  <!-- Draw the pentagon ABCDE -->
+  <polygon fill="none" stroke="black" stroke-width="2" points="100,50 200,0 290,100 180,200 20,100" />
+  
+  <!-- Draw segment AD -->
+  <line x1="100" y1="50" x2="290" y2="100" stroke="black" stroke-width="2" />
+  
+  <!-- Calculate and draw points G and H dividing AD into three equal parts -->
+  <!-- Point G is at 1/3 of AD -->
+  <circle cx="170" cy="90" r="3" fill="red" stroke="red" stroke-width="2" />
+  <circle cx="170" cy="90" r="3" fill="black" stroke="black" stroke-width="2" />
+  <!-- Point H is at 2/3 of AD -->
+  <circle cx="230" cy="130" r="3" fill="red" stroke="red" stroke-width="2" />
+  <circle cx="230" cy="130" r="3" fill="black" stroke="black" stroke-width="2" />
+</svg>
+```
+
+This SVG code draws the pentagon \(ABCDE\) with black solid strokes, the segment \(AD\) with a black stroke, and the points \(G\) and \(H\) with red dashed strokes. The red and black circles represent the existing and new points, respectively. You can adjust the coordinates as per your specific requirements.
+<SPECIAL_12>

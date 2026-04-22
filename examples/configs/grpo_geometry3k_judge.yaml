@@ -1,0 +1,33 @@
+# GRPO on Geometry3K with the full SVG-aux reward mix (fmt + judge + solve).
+#
+# Inherits grpo_geometry3k.yaml and overrides:
+#   - reward_functions: svg_format(0.2) + svg_judge_group(0.4) + svg_solve_aux(0.4)
+#   - checkpoint_dir and logger project scoped to this run type
+#
+# Prerequisites:
+#   - OPENROUTER_API_KEY (+ friends) set in the worktree-root .env;
+#     nemo_rl.hackaton._env.load_dotenv_once picks it up from there.
+#   - resvg-py installed (added to pyproject dependencies).
+#   - Warm-start checkpoint decision resolved in the base config's
+#     policy.model_name (see TODO in grpo_geometry3k.yaml).
+
+defaults: "grpo_geometry3k.yaml"
+
+checkpointing:
+  checkpoint_dir: "results/grpo_geometry3k_judge"
+
+logger:
+  wandb:
+    project: "render-reward"
+    name: "grpo-geometry3k-judge"
+
+env:
+  geometry3k:
+    num_workers: 4
+    reward_functions:
+      - name: svg_format
+        weight: 0.2
+      - name: svg_judge_group
+        weight: 0.4
+      - name: svg_solve_aux
+        weight: 0.4

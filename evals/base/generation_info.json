@@ -1,0 +1,10 @@
+{
+  "model_dir": "nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16",
+  "data_jsonl": "/ephemeral/vuvlm/sft-data/sft_llava_prod_foundational_jsonl/train_00500.jsonl",
+  "n": 32,
+  "dp": 8,
+  "max_new_tokens": 4096,
+  "max_model_len": 16384,
+  "seed": 42,
+  "generation_seconds": 166.35445761680603
+}
